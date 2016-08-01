@@ -5,6 +5,8 @@
    Brian Knittel
    Revision History
 
+   2016.08.01 - Fixed Scan Check mechanism. Was badly broken before.
+
    2006.12.06 - Moved CGI stuff out of this routine into cgi1130 main() module.
 
    2006.07.06 - Made 1403 printer 132 columns wide, was 120 previously
@@ -101,29 +103,20 @@ static int32 prt_twait = 50;								/* transfer wait, for 1403 operations */
 
 static t_bool formfed = FALSE;								/* last line printed was a formfeed */
 
-#define UNIT_V_FORMCHECK    (UNIT_V_UF + 0)					/* out of paper error */
-#define UNIT_V_DATACHECK    (UNIT_V_UF + 1)					/* printer overrun error */
+															/* the unused UNIT_V_UF offsets are available for future uses */
 #define UNIT_V_SKIPPING	    (UNIT_V_UF + 2)					/* printer skipping */
 #define UNIT_V_SPACING	    (UNIT_V_UF + 3)					/* printer is spacing */
 #define UNIT_V_PRINTING	    (UNIT_V_UF + 4)					/* printer printing */
 #define UNIT_V_TRANSFERRING (UNIT_V_UF + 5)					/* unit is transferring print buffer (1403 only) */
 #define UNIT_V_1403		    (UNIT_V_UF + 6)					/* printer model is 1403 rather than 1132 */
-#define UNIT_V_PARITYCHECK	(UNIT_V_UF + 7)					/* error flags for 1403 */
-#define UNIT_V_RINGCHECK	(UNIT_V_UF + 8)
-#define UNIT_V_SYNCCHECK	(UNIT_V_UF + 9)
 #define UNIT_V_PHYSICAL_PTR	(UNIT_V_UF + 10)				/* this appears in ibm1130_gui as well */
 #define UNIT_V_TRACE        (UNIT_V_UF + 11)
 
-#define UNIT_FORMCHECK	  (1u << UNIT_V_FORMCHECK)
-#define UNIT_DATACHECK	  (1u << UNIT_V_DATACHECK)
 #define UNIT_SKIPPING	  (1u << UNIT_V_SKIPPING)
 #define UNIT_SPACING	  (1u << UNIT_V_SPACING)
 #define UNIT_PRINTING	  (1u << UNIT_V_PRINTING)
 #define UNIT_TRANSFERRING (1u << UNIT_V_TRANSFERRING)
 #define UNIT_1403	 	  (1u << UNIT_V_1403)
-#define UNIT_PARITYCHECK  (1u << UNIT_V_PARITYCHECK)	
-#define UNIT_RINGCHECK	  (1u << UNIT_V_RINGCHECK)
-#define UNIT_SYNCCHECK	  (1u << UNIT_V_SYNCCHECK)
 #define UNIT_PHYSICAL_PTR (1u << UNIT_V_PHYSICAL_PTR)
 #define UNIT_TRACE		  (1u << UNIT_V_TRACE)
 
@@ -229,10 +222,15 @@ static void reset_prt_line (void)
 
 /* save_1132_prt_line - fire hammers for character 'ch' */
 
+#define SCAN_BUFFER_ADDRESS		32			/* hardwired address of 8 word buffer used by 1132 printer to hold hammer bitmap */
+
 static t_bool save_1132_prt_line (int ch)
 {
-	int i, r, addr = 32;
-	int32 mask = 0, wd = 0;
+	int i, r, addr = SCAN_BUFFER_ADDRESS;
+	uint16 mask = 0, wd = 0;
+
+	if (! (M[SCAN_BUFFER_ADDRESS+7] & 1))	/* examine LSB (bit 15 in IBM nomenclature) of the last scan buffer word */
+		return FALSE;						/* scan-prepared bit is not set. Don't fire hammers (don't save data), just set scan check  */
 
 	for (i = 0; i < PRT1132_COLUMNS; i++) {
 		if (mask == 0) {					/* fetch next word from memory */
@@ -257,7 +255,7 @@ static t_bool save_1132_prt_line (int ch)
 		mask >>= 1;														/* prepare to examine next bit */
 	}
 
-	return wd & 1;			/* return TRUE if the last word has lsb set, which means all bits had been set */
+	return TRUE;														/* successful scan save */
 }
 
 /* write_line - write collected line to output file. No need to trim spaces as the hammers
@@ -348,12 +346,20 @@ static void flush_prt_line (FILE *fd, int spacemode, t_bool physical_printer)
 
 extern const char * saywhere (int addr);
 
-static void mytrace (int start, const char *what)
+static t_bool do_say_where = TRUE;		// used for tracing, to print IAR at time of trace, on first of multiple trace calls
+
+static void mytrace (const char *what)
 {
 	const char *where;
 
-	if ((where = saywhere(prev_IAR)) == NULL) where = "?";
-	trace_io("%s %s at %04x: %s", start ? "start" : "stop", what, prev_IAR, where);
+	if (do_say_where) {
+		if ((where = saywhere(prev_IAR)) == NULL) where = "?";
+		trace_io("1132print %s at %04x: %s", what, prev_IAR, where);
+		do_say_where = FALSE;		// once per XIO or interrupt is enough for extra info on location of call
+	}
+	else {
+		trace_io("1132print %s", what);
+	}
 }
 
 /* xio_1132_printer - XIO command interpreter for the 1132 printer */
@@ -362,6 +368,8 @@ void xio_1132_printer (int32 iocc_addr, int32 func, int32 modify)
 {
 	char msg[80];
 	UNIT *uptr = &prt_unit[0];
+
+	do_say_where = TRUE;
 
 	switch (func) {
 		case XIO_READ:
@@ -374,36 +382,37 @@ void xio_1132_printer (int32 iocc_addr, int32 func, int32 modify)
 		case XIO_SENSE_DEV:
 			ACC = PRT_DSW;
 			if (modify & 0x01) {								/* reset interrupts */
-				CLRBIT(PRT_DSW, PRT1132_DSW_READ_EMITTER_RESPONSE | PRT1132_DSW_SKIP_RESPONSE | PRT1132_DSW_SPACE_RESPONSE);
+				// 27-July-2016: added PRT1132_DSW_PRINT_SCAN_CHECK to this. BK
+				CLRBIT(PRT_DSW, PRT1132_DSW_READ_EMITTER_RESPONSE | PRT1132_DSW_SKIP_RESPONSE | PRT1132_DSW_SPACE_RESPONSE|PRT1132_DSW_PRINT_SCAN_CHECK);
 				CLRBIT(ILSW[1], ILSW_1_1132_PRINTER);
 			}
-			trace_io("* Printer DSW %04x mod %x", ACC, modify);
+			if (DO_TRACE(uptr))	trace_io("* Printer DSW %04x mod %x", ACC, modify);
 			break;
 
 		case XIO_CONTROL:
 			if (modify & PRT_CMD_START_PRINTER) {
 				SETBIT(uptr->flags, UNIT_PRINTING);
-				if (DO_TRACE(uptr)) mytrace(1, "printing");
+				if (DO_TRACE(uptr)) mytrace("start printing");
 			}
 
 			if (modify & PRT_CMD_STOP_PRINTER) {
 				CLRBIT(uptr->flags, UNIT_PRINTING);
-				if (DO_TRACE(uptr)) mytrace(0, "printing");
+				if (DO_TRACE(uptr)) mytrace("stop printing");
 			}
 
 			if (modify & PRT_CMD_START_CARRIAGE) {
 				SETBIT(uptr->flags, UNIT_SKIPPING);
-				if (DO_TRACE(uptr))	mytrace(1, "skipping");
+				if (DO_TRACE(uptr))	mytrace("start skipping");
 			}
 
 			if (modify & PRT_CMD_STOP_CARRIAGE) {
 				CLRBIT(uptr->flags, UNIT_SKIPPING);
-				if (DO_TRACE(uptr))	mytrace(0, "skipping");
+				if (DO_TRACE(uptr))	mytrace("stop skipping");
 			}
 
 			if (modify & PRT_CMD_SPACE) {
 				SETBIT(uptr->flags, UNIT_SPACING);
-				if (DO_TRACE(uptr))	mytrace(1, "space");
+				if (DO_TRACE(uptr))	mytrace("start spacing");
 			}
 
 			sim_cancel(uptr);
@@ -431,7 +440,7 @@ void xio_1132_printer (int32 iocc_addr, int32 func, int32 modify)
 	}
 }
 
-#define SET_ACTION(u,a) {(u)->flags &= ~(UNIT_SKIPPING|UNIT_SPACING|UNIT_PRINTING|UNIT_TRANSFERRING); (u)->flags |= a;}
+#define SET_ACTION(u,action) (u)->flags = ((u)->flags & ~(UNIT_SKIPPING|UNIT_SPACING|UNIT_PRINTING|UNIT_TRANSFERRING)) | action
 
 static t_stat prt_svc (UNIT *uptr)
 {
@@ -440,17 +449,26 @@ static t_stat prt_svc (UNIT *uptr)
 
 /* prt1132_svc - emulated timeout for 1132 operation */
 
+#define MAXSKIP	(2*66)				/* if the carriage control tape for some reason has no holes, skip at most two pages */
+
 static t_stat prt1132_svc (UNIT *uptr)
 {
+	int wait_time = prt_cwait;
+	int nskip;
+
+	do_say_where = TRUE;
+
+	if (DO_TRACE(uptr))	mytrace("service handler called here");
+
 	if (PRT_DSW & PRT1132_DSW_NOT_READY) {					/* cancel operation if printer went offline */
-		if (DO_TRACE(uptr))	trace_io("1132 form check");
-		SETBIT(uptr->flags, UNIT_FORMCHECK);
+		if (DO_TRACE(uptr)) mytrace("1132 not ready -> form check");
 		SET_ACTION(uptr, 0);
 		forms_check(TRUE);									/* and turn on forms check lamp */
 		return SCPE_OK;
 	}
 
 	if (uptr->flags & UNIT_SPACING) {
+		if (DO_TRACE(uptr)) mytrace("spacing complete");
 		flush_prt_line(uptr->fileref, UNIT_SPACING, IS_PHYSICAL(uptr));
 
 		CLRBIT(PRT_DSW, PRT1132_DSW_CHANNEL_MASK|PRT1132_DSW_PRINTER_BUSY|PRT1132_DSW_CARRIAGE_BUSY);
@@ -461,29 +479,27 @@ static t_stat prt1132_svc (UNIT *uptr)
 	}
 
 	if (uptr->flags & UNIT_SKIPPING) {
+		if (DO_TRACE(uptr)) mytrace("skipping complete");
+		nskip = 0;
 		do {
 			flush_prt_line(uptr->fileref, UNIT_SKIPPING, IS_PHYSICAL(uptr));
 			CLRBIT(PRT_DSW, PRT1132_DSW_CHANNEL_MASK);
 			SETBIT(PRT_DSW, cc_format_1132(cctape[prt_row]));
-		} while ((cctape[prt_row] & CC_1132_BITS) == 0);			/* slew directly to a cc tape punch */
+			++nskip;
+		} while ((nskip < MAXSKIP) && ((cctape[prt_row] & CC_1132_BITS) == 0));	/* slew directly to a cc tape punch */
 
 		SETBIT(PRT_DSW, cc_format_1132(cctape[prt_row]) | PRT1132_DSW_SKIP_RESPONSE);
 		SETBIT(ILSW[1], ILSW_1_1132_PRINTER);
 		calc_ints();
+		wait_time = prt_swait;										/* time to next interrupt */
 	}
 
 	if (uptr->flags & UNIT_PRINTING) {
+		if (DO_TRACE(uptr)) mytrace("print cycle");
 		if (! save_1132_prt_line(codewheel1132[prt_nchar].ascii)) {	/* save previous printed line */
-			trace_io("* Print check -- buffer not set in time");
-			SETBIT(uptr->flags, UNIT_DATACHECK);					/* buffer wasn't set in time */
-			SET_ACTION(uptr, 0);
-			print_check(TRUE);										/* and turn on forms check lamp */
-
-/*	if (running)
-		reason = STOP_IMMEDIATE;	// halt on check
-*/
-
-			return SCPE_OK;
+			// 27-July-2016: fixed this, should set PRT1132_DSW_PRINT_SCAN_CHECK in addtion to PRT1132_DSW_READ_EMITTER_RESPONSE
+			if (DO_TRACE(uptr)) mytrace("buffer not set in time -> scan check");
+			SETBIT(PRT_DSW, PRT1132_DSW_PRINT_SCAN_CHECK);
 		}
 
 		prt_nchar = (prt_nchar + 1) % WHEELCHARS_1132;				/* advance print drum */
@@ -495,14 +511,15 @@ static t_stat prt1132_svc (UNIT *uptr)
 
 	if (uptr->flags & (UNIT_SPACING|UNIT_SKIPPING|UNIT_PRINTING)) {	/* still doing something */
 		SETBIT(PRT_DSW, PRT1132_DSW_PRINTER_BUSY);
-		sim_activate(uptr, prt_cwait);
+		sim_activate(uptr, wait_time);
 	}
-	else
+	else {
+		if (DO_TRACE(uptr)) mytrace("done, no more interrupts");
 		CLRBIT(PRT_DSW, PRT1132_DSW_PRINTER_BUSY);
+	}
 
 	return SCPE_OK;
 }
-
 void save_1403_prt_line (int32 addr)
 {
 	size_t j;
@@ -693,8 +710,7 @@ static t_stat prt_reset (DEVICE *dptr)
 	prt_row   = 0;
 	prt_nnl   = 0;
 
-	CLRBIT(uptr->flags, UNIT_FORMCHECK|UNIT_DATACHECK|UNIT_PRINTING|UNIT_SPACING|UNIT_SKIPPING|
-						UNIT_TRANSFERRING|UNIT_PARITYCHECK|UNIT_RINGCHECK|UNIT_SYNCCHECK);
+	CLRBIT(uptr->flags, UNIT_PRINTING|UNIT_SPACING|UNIT_SKIPPING|UNIT_TRANSFERRING);
 
 	if (IS_1132(uptr)) {
 		CLRBIT(ILSW[1], ILSW_1_1132_PRINTER);
@@ -760,11 +776,9 @@ static t_stat prt_attach (UNIT *uptr, CONST char *cptr)
 
 	if (IS_1132(uptr)) {
 		CLRBIT(ILSW[1], ILSW_1_1132_PRINTER);
-		CLRBIT(uptr->flags, UNIT_FORMCHECK|UNIT_DATACHECK);
 	}
 	else {
 		CLRBIT(ILSW[4], ILSW_4_1403_PRINTER);
-		CLRBIT(uptr->flags, UNIT_PARITYCHECK|UNIT_RINGCHECK|UNIT_SYNCCHECK);
 	}
 
 	SET_ACTION(uptr, 0);
@@ -777,7 +791,6 @@ static t_stat prt_attach (UNIT *uptr, CONST char *cptr)
 
 	if (IS_1132(uptr)) {
 		PRT_DSW = (PRT_DSW & ~PRT1132_DSW_CHANNEL_MASK) | cc_format_1132(cctape[prt_row]);
-
 		if (IS_ONLINE(uptr))
 			CLRBIT(PRT_DSW, PRT1132_DSW_NOT_READY);
 	}
@@ -816,7 +829,6 @@ static t_stat prt_detach (UNIT *uptr)
 
 	if (IS_1132(uptr)) {
 		CLRBIT(ILSW[1], ILSW_1_1132_PRINTER);
-		CLRBIT(uptr->flags, UNIT_FORMCHECK|UNIT_DATACHECK);
 		SETBIT(PRT_DSW, PRT1132_DSW_NOT_READY);
 	}
 	else {

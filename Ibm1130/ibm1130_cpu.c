@@ -32,6 +32,7 @@
 					on ops that don't have long mode, blowing out the SAR/SBR display that's important in the 
 					IBM diagnostics. The simulator was decrementing the IAR after the incorrect fetch, so the 
 					instructions worked correctly, but, the GUI display was wrong.
+   01-Aug-16 BLK	Made some changes in the CPU and IO tracing code.
 
 >> To do: verify actual operands stored in ARF, need to get this from state diagrams in the schematic set
    Also: determine how many bits are actually stored in the IAR in a real 1130, by forcing wraparound
@@ -212,6 +213,7 @@ t_bool cgi     = FALSE;				/* TRUE if we are running as a CGI program */
 t_bool cgiwritable = FALSE;			/* TRUE if we can write the disk images back to the image file in CGI mode */
 t_bool is_1800 = FALSE;				/* TRUE if we are simulating an IBM 1800 processor */
 t_stat reason;						/* CPU execution loop control */
+uint32 sim_ticks = 0;				/* total simulation CPU tick (instruction) count, never reset, useful for sim debugging */
 
 static int32 int_masks[6] = {
 	0x00, 0x20, 0x30, 0x38, 0x3C, 0x3E		/* IPL 0 is highest prio (sees no other interrupts) */
@@ -255,6 +257,7 @@ static t_stat view_cmd (int32 flag, CONST char *cptr);
 static t_stat cpu_attach (UNIT *uptr, CONST char *cptr);
 static t_bool bsctest (int32 DSPLC, t_bool reset_V);
 static void   exit_irq (void);
+static void   trace_common (FILE *fout);
 static void   trace_instruction (void);
 
 /* ------------------------------------------------------------------------
@@ -485,7 +488,6 @@ t_stat sim_instr (void)
 	int32 iocc_addr, iocc_op, iocc_dev, iocc_func, iocc_mod, result;
 	char msg[50];
 	int cwincount = 0, status;
-	static long ninstr = 0;
 	static const char *intlabel[] = {"INT0","INT1","INT2","INT3","INT4","INT5"};
 
 	/* the F bit indicates a two-word instruction for most instructions except the ones marked FALSE below */
@@ -614,7 +616,7 @@ t_stat sim_instr (void)
 			continue;
 		}
 
-		ninstr++;
+		sim_ticks++;						/* count total number of instructions executed. Helpful e.g. for setting breakpoints when debugging this code */
 		if ((cpu_unit.flags & (UNIT_ATT|UNIT_TRACE_INSTR)) == (UNIT_ATT|UNIT_TRACE_INSTR))
 			trace_instruction();			/* log CPU details if logging is enabled */
 
@@ -1749,7 +1751,6 @@ static void trace_instruction (void)
 	t_value v[2];
 	float fac;
 	short exp;
-	int addr;
 	PSYMENTRY s;
 	long mant, sign;
 	char facstr[20], fltstr[20];
@@ -1761,9 +1762,11 @@ static void trace_instruction (void)
 		fseek(cpu_unit.fileref, 0, SEEK_END);
 		new_log = FALSE;
 
-		fprintf(cpu_unit.fileref, " IAR%s  ACC  EXT %s XR1  XR2  XR3 CVI %sOPERATION" CRLF,
+		fprintf(cpu_unit.fileref, "%27s", "");		// spaces for trace_common items
+		fprintf(cpu_unit.fileref, "%s  ACC  EXT %s XR1  XR2  XR3 CVI %sOPERATION" CRLF,
 			syms ? "           " : "", log_fac ? " (flt)   " : "", log_fac ? "     FAC      " : "");
-		fprintf(cpu_unit.fileref, "----%s ---- ---- %s---- ---- ---- --- %s-----------------------" CRLF,
+		fprintf(cpu_unit.fileref, "%27s", "");		// spaces for trace_common items
+		fprintf(cpu_unit.fileref, "%s ---- ---- %s---- ---- ---- --- %s-----------------------" CRLF,
 			syms ? "-----------" : "", log_fac ? "-------- " : "", log_fac ? "------------- " : "");
 	}
 
@@ -1813,18 +1816,19 @@ static void trace_instruction (void)
 			strcpy(facstr, "             ");
 	}
 
-	addr = IAR & 0xFFFF;
-	fprintf(cpu_unit.fileref, "%04x ", addr);
+	trace_common(cpu_unit.fileref);
 
 	if (syms) {
+		long addr = IAR & 0xFFFF;
+	
 		for (s = syms; s != NULL; s = s->next)
 			if (s->addr <= addr)
 				break;
 		
 		if (s == NULL)
-			fprintf(cpu_unit.fileref, "      %04x ", addr);
+			fprintf(cpu_unit.fileref, "      %04lx ", addr);
 		else
-			fprintf(cpu_unit.fileref, "%-5s+%04x ", s->sym, addr - s->addr);
+			fprintf(cpu_unit.fileref, "%-5s+%04lx ", s->sym, addr - s->addr);
 	}
 
 	fprintf(cpu_unit.fileref, "%04x %04x %s%04x %04x %04x %c%c%c %s",
@@ -1840,7 +1844,7 @@ static void trace_instruction (void)
 
 static void trace_common (FILE *fout)
 {
-	fprintf(fout, "[IAR %04x IPL %c] ", IAR, (ipl < 0) ? ' ' : ('0' + ipl));
+	fprintf(fout, (ipl < 0) ? "[%-10d IAR %04x     ] " : "[%-10d IAR %04x IPL%c] ", sim_ticks, IAR, '0' + ipl);
 }
 
 void trace_io (const char *fmt, ...)

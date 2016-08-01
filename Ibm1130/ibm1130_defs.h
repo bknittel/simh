@@ -76,6 +76,7 @@ extern t_bool power;
 extern t_bool cgi;							/* TRUE if we are running as a CGI program */
 extern t_bool cgiwritable;					/* TRUE if we can write to the disk image file in CGI mode */
 extern t_stat reason;						/* CPU execution loop control */
+extern uint32 sim_ticks;					/* total simulation CPU tick (instruction) count, never reset, useful for sim debugging */
 
 #define WAIT_OP			 1		/* wait state causes: wait instruction, invalid instruction*/
 #define WAIT_INVALID_OP  2

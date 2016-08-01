@@ -81,8 +81,8 @@ static void enable_dms_tracing (int newsetting);
 static int16 dsk_dsw[DSK_NUMDR] = {DSK_DSW_NOT_READY, DSK_DSW_NOT_READY, DSK_DSW_NOT_READY, DSK_DSW_NOT_READY, DSK_DSW_NOT_READY};
 static int16 dsk_sec[DSK_NUMDR] = {0};	/* next-sector-up */
 static char dsk_lastio[DSK_NUMDR];		/* last stdio operation: IO_READ or IO_WRITE */
-int32 dsk_swait = 50;					/* seek time  -- see how short a delay we can get away with */
-int32 dsk_rwait = 50;					/* rotate time */
+int32 dsk_swait = 200;					/* seek time. 01-Aug-2016, increased disk delay from 50 to 200 to avoid race condition in DUP during DUP STORECI */
+int32 dsk_rwait = 200;					/* rotate time */
 static t_bool raw_disk_debug = FALSE;
 
 static t_stat dsk_svc    (UNIT *uptr);
@@ -242,11 +242,7 @@ void xio_disk (int32 iocc_addr, int32 func, int32 modify, int drv)
 				uptr->FUNC = DSK_FUNC_READ;
 			}
 			else {
-				trace_io("* DSK%d verify %d.%d (%x)", drv, uptr->CYL, sec, uptr->CYL*8 + sec);
-
-				if (raw_disk_debug)
-					printf("* DSK%d verify %d.%d (%x)", drv, uptr->CYL, sec, uptr->CYL*8 + sec);
-
+				(*(raw_disk_debug ? &trace_both : &trace_io))("* DSK%d verify %d.%d (%x)", drv, uptr->CYL, sec, uptr->CYL*8 + sec);
 				uptr->FUNC = DSK_FUNC_VERIFY;
 			}
 
@@ -280,10 +276,7 @@ void xio_disk (int32 iocc_addr, int32 func, int32 modify, int drv)
 			sec    = modify & 0x07;					/* get sector on cylinder */
 			newpos = (uptr->CYL*DSK_NUMSC*DSK_NUMSF + sec)*2*DSK_NUMWD;
 
-			trace_io("* DSK%d wrote %d words from M[%04x-%04x] to %d.%d (%x, %x)", drv, nwords, iocc_addr & mem_mask, (iocc_addr + nwords - 1) & mem_mask, uptr->CYL, sec, uptr->CYL*8 + sec, newpos);
-
-			if (raw_disk_debug)
-				printf("* DSK%d XIO @ %04x wrote %d words from M[%04x-%04x] to %d.%d (%x, %x)\n", drv, prev_IAR, nwords, iocc_addr & mem_mask, (iocc_addr + nwords - 1) & mem_mask, uptr->CYL, sec, uptr->CYL*8 + sec, newpos);
+			(*(raw_disk_debug ? &trace_both : &trace_io))("* DSK%d wrote %d words from M[%04x-%04x] to %d.%d (%x, %x)", drv, nwords, iocc_addr & mem_mask, (iocc_addr + nwords - 1) & mem_mask, uptr->CYL, sec, uptr->CYL*8 + sec, newpos);
 
 #ifdef TRACE_DMS_IO
 			if (trace_dms)
@@ -296,8 +289,14 @@ void xio_disk (int32 iocc_addr, int32 func, int32 modify, int drv)
 				buf[i] = 0;
 
 			i = uptr->CYL*8 + sec;
-			if (buf[0] != i)
-				printf("*DSK writing bad sector#\n");
+
+// Hmmm. DMS always writes the sector number as the first word of each sector, so that on read back it can
+// be sure that the head is on the correct cylinder. But, other operating systems might not do this. Haven't encountered
+// one, but, I don't think this check is necessary.
+//			if (buf[0] != i) {
+//				sprintf(msg, "*Writing bad sector # %d into sector %d\n", buf[i], i);
+//				xio_error(msg);
+//			}
 
 			if (MEM_MAPPED(uptr)) {
 				memcpy((char *) uptr->filebuf + newpos, buf, 2*DSK_NUMWD);
@@ -341,7 +340,7 @@ void xio_disk (int32 iocc_addr, int32 func, int32 modify, int drv)
 			sim_activate(uptr, dsk_swait);			/* schedule interrupt */
 
 			dsk_dsw[drv] |= DSK_DSW_DISK_BUSY;
-			trace_io("* DSK%d at cyl %d", drv, newcyl);
+			(*(raw_disk_debug ? &trace_both : &trace_io))("* DSK%d at cyl %d", drv, newcyl);
 			break;
 
 		case XIO_SENSE_DEV:
@@ -433,13 +432,9 @@ static t_stat dsk_svc (UNIT *uptr)
 
 			void_backtrace(iocc_addr, iocc_addr + nwords - 1);		/* mark prev instruction as altered */
 
-			trace_io("* DSK%d read %d words from %d.%d (%x, %x) to M[%04x-%04x]", drv, nwords, uptr->CYL, sec, uptr->CYL*8 + sec, newpos, iocc_addr & mem_mask,
-				(iocc_addr + nwords - 1) & mem_mask);
-
 			/* this will help debug the monitor by letting me watch phase loading */
-			if (raw_disk_debug)
-				printf("* DSK%d XIO @ %04x read %d words from %d.%d (%x, %x) to M[%04x-%04x]\n", drv, prev_IAR, nwords, uptr->CYL, sec, uptr->CYL*8 + sec, newpos, iocc_addr & mem_mask,
-					(iocc_addr + nwords - 1) & mem_mask);
+			(*(raw_disk_debug ? &trace_both : &trace_io))("* DSK%d read %d words from %d.%d (%x, %x) to M[%04x-%04x]", drv, nwords, uptr->CYL, sec, uptr->CYL*8 + sec, newpos, iocc_addr & mem_mask,
+				(iocc_addr + nwords - 1) & mem_mask);
 
 			i = uptr->CYL*8 + sec;
 			if (buf[0] != i)
